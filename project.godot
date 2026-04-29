@@ -1,0 +1,25 @@
+; Engine configuration file.
+; Generated for petri-primordial.
+
+config_version=5
+
+[application]
+
+config/name="petri-primordial"
+config/description="Synthetic-life petri dish prototype."
+run/main_scene="res://scenes/petri/PetriDish.tscn"
+config/features=PackedStringArray("4.3", "GL Compatibility")
+config/icon="res://icon.svg"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=800
+window/stretch/mode="canvas_items"
+window/stretch/aspect="keep"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.95, 0.93, 0.88, 1)
