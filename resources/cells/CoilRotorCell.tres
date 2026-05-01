@@ -1,0 +1,18 @@
+[gd_resource type="Resource" script_class="CellSignature" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/petri/CellSignature.gd" id="1_csig"]
+
+[resource]
+script = ExtResource("1_csig")
+geometry_type = "spiral"
+material_type = "soft"
+rhythm_frequency = 1.40
+rhythm_phase = 0.0
+charge_capacity = 1.10
+charge = 0.0
+noise = 0.10
+stability = 0.70
+impulse_bias = 0.25
+storage_bias = 0.30
+rhythm_bias = 0.95
+memory_tags = Array[String](["seed", "coil-rotor"])
