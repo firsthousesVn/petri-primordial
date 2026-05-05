@@ -2,7 +2,7 @@ extends Node2D
 class_name CellBody
 
 @export var signature: CellSignature
-@export var radius: float = 14.0
+@export var radius: float = 22.0
 @export var selected: bool = false
 
 var velocity: Vector2 = Vector2.ZERO
@@ -22,6 +22,17 @@ var seek_strength: float = 0.0
 var capture_strength: float = 0.0
 var snap_flash: float = 0.0
 var clash_flash: float = 0.0
+# --- Field-overlap interaction state (filled by PetriDish._compute_field_overlap_pass) ---
+# Reset every frame in begin_interaction_frame(). Read by motion (real attraction
+# from overlap, not a separate seek rule), by bond scoring (overlap escalates
+# bond pressure), and by the contour renderer (visuals reflect cached sim).
+var field_interaction_vec: Vector2 = Vector2.ZERO   # net per-frame force vec from overlapping neighbors
+var field_neighbor_dir: Vector2 = Vector2.ZERO      # weighted average direction toward overlapping neighbors (unit-ish)
+var field_overlap_energy: float = 0.0               # accumulated overlap × strength magnitude
+var field_bond_pressure: float = 0.0                # accumulated overlap × compatibility
+var field_polarity_bias: float = 0.0                # signed scalar: + = aligned neighbor axes, - = anti
+var field_overlap_count: int = 0                    # number of overlapping neighbors this frame
+var field_compression: float = 0.0                  # 0..1 turbulence/compression when overlap is too deep
 # Smoothed spin-direction state for coil/spiral cells. Initialized lazily on
 # first field interaction so it doesn't flip due to numerical noise.
 var _coil_dir_state: float = 0.0
@@ -45,20 +56,11 @@ var field_arc_count: int = 1         # families per polarity side (1..2)
 var polarity_phase: float = 0.0      # persistent phase offset for breathing/flicker
 var field_seed: float = 0.0          # persistent per-cell visual seed
 
-# Persistent per-cell plasma state. Assigned once on _ready so the local plasma
-# field has temporal continuity instead of restarting each frame from per-frame
-# random sources. _plasma_time advances monotonically; _plasma_seed offsets the
-# phase per cell so neighbors do not pulse in unison. The two smoothed values
-# low-pass the directional bias and interaction strength so transient changes
-# (a neighbor entering reach radius, a bond capturing) deform the sheath
-# gradually instead of snapping the visual to a new state.
+# Per-cell breathing seed. _plasma_time advances monotonically; _plasma_seed
+# offsets the phase so neighbors do not pulse in unison.
 var _plasma_time: float = 0.0
 var _plasma_seed: float = 0.0
 var _last_process_delta: float = 1.0 / 60.0
-var _plasma_bias_smooth: Vector2 = Vector2.ZERO
-var _plasma_interaction_smooth: float = 0.0
-const PLASMA_BIAS_LERP_RATE: float = 3.5
-const PLASMA_INTERACTION_LERP_RATE: float = 4.5
 
 const TRAIL_MAX: int = 7
 const TRAIL_INTERVAL: float = 0.07
@@ -134,7 +136,7 @@ const ROUND_BROWNIAN_DEPLETED: float = 0.012
 const ROUND_BROWNIAN_HEALTHY: float = 0.0015
 const ROUND_BROWNIAN_OVERCHARGED: float = 0.003
 const ROUND_NOISE_AVOID_MIN: float = 0.10
-const SPHERE_AMBIENT_DRIFT_GAIN: float = 4.8
+const SPHERE_AMBIENT_DRIFT_GAIN: float = 7.6
 const SPHERE_AMBIENT_CALM_PREFERENCE: float = 5.4
 const SPHERE_AMBIENT_ALIGN_GAIN: float = 0.10
 
@@ -161,26 +163,9 @@ const CRESCENT_AMBIENT_SHAPE_GAIN: float = 4.0
 const CRESCENT_AMBIENT_ALIGN_GAIN: float = 0.40
 const AMBIENT_SAMPLE_RADIUS: float = 28.0
 const AMBIENT_GRADIENT_MIN: float = 0.010
-const LOCAL_PLASMA_ENABLED: bool = true
-const LOCAL_PLASMA_CORE_WIDTH: float = 1.45
-const LOCAL_PLASMA_GLOW_WIDTH: float = 4.2
-const LOCAL_PLASMA_CORE_ALPHA: float = 0.26
-const LOCAL_PLASMA_GLOW_ALPHA: float = 0.10
-const LOCAL_PLASMA_BRIGHTNESS_GAIN: float = 1.20
-const LOCAL_PLASMA_THICKNESS_GAIN: float = 1.08
-const LOCAL_PLASMA_DISTORTION_GAIN: float = 0.20
-const LOCAL_PLASMA_INTERACTION_GAIN: float = 0.60
-const LOCAL_PLASMA_PULSE_GAIN: float = 0.15
-const LOCAL_PLASMA_PULSE_SPEED: float = 1.65
-const CELL_PLASMA_CORE_BRIGHTNESS: float = 1.26
-const CELL_PLASMA_SHEATH_WIDTH: float = 0.16
-const CELL_PLASMA_SHEATH_BRIGHTNESS: float = 0.78
+# Cell-body sheath dial. Soft inner highlight only; no projected territory or
+# filaments — the visible field expression is the dipole arc renderer.
 const CELL_PLASMA_FLOW_SPEED: float = 0.62
-const CELL_PLASMA_WARP_STRENGTH: float = 0.20
-const CELL_PLASMA_FILAMENT_ALPHA: float = 0.18
-const CELL_PLASMA_FILAMENT_COUNT: int = 4
-const CELL_PLASMA_FILAMENT_WIDTH: float = 0.90
-const CELL_PLASMA_FILAMENT_GLOW_WIDTH: float = 2.35
 
 # --- wedge impulse ---
 const WEDGE_IMPULSE_THRESHOLD: float = 0.40
@@ -446,18 +431,16 @@ func _process(delta: float) -> void:
 	rotation += angular_velocity * delta
 	if dash_pulse > 0.0:
 		dash_pulse = maxf(0.0, dash_pulse - DASH_PULSE_DECAY * delta)
-	_sample_trail(delta)
+	# Trail sampling disabled: trail rendering is removed in the cleanup pass
+	# (loose ribbons violate the visual contract). No trail consumers remain.
+	# _sample_trail(delta)
 	queue_redraw()
 
 
-func _sample_trail(delta: float) -> void:
-	_trail_accum += delta
-	if _trail_accum < TRAIL_INTERVAL:
-		return
-	_trail_accum = 0.0
-	_trail.append(position)
-	while _trail.size() > TRAIL_MAX:
-		_trail.remove_at(0)
+func _sample_trail(_delta: float) -> void:
+	# DISABLED legacy path. See _process for context. Kept as a no-op so any
+	# straggling caller compiles. No-op intentionally — trails are gone.
+	pass
 
 
 # --- field interaction ---
@@ -524,6 +507,13 @@ func _decay_internal_noise(delta: float) -> void:
 func begin_interaction_frame() -> void:
 	seek_strength = 0.0
 	capture_strength = 0.0
+	field_interaction_vec = Vector2.ZERO
+	field_neighbor_dir = Vector2.ZERO
+	field_overlap_energy = 0.0
+	field_bond_pressure = 0.0
+	field_polarity_bias = 0.0
+	field_overlap_count = 0
+	field_compression = 0.0
 
 
 func apply_velocity_delta(delta_v: Vector2) -> void:
@@ -1099,12 +1089,6 @@ func _draw() -> void:
 			_draw_crescent(jitter, r, brightness, alpha, chroma)
 		_:
 			_draw_round(jitter, r, brightness, alpha, chroma, round_field_ctx)
-	# Per-cell polyline plasma halo. Produced a studded / serrated look
-	# (evenly spaced sample points with traveling pulse-packet envelopes).
-	# Replaced by the dish-level shader-driven LocalPlasmaOverlay; this path
-	# is retained as a legacy fallback only.
-	if PetriDish.LOCAL_PLASMA_LEGACY_DRAW:
-		_draw_local_plasma(jitter, r, charge_ratio, excess_noise, _last_process_delta)
 
 	var cue_axis: Vector2 = Vector2.UP
 	if geom == "round" and not round_field_ctx.is_empty():
@@ -1185,71 +1169,6 @@ func _chroma_pair(base: Color, chroma: float) -> Array:
 	return [cy, mg]
 
 
-func _local_plasma_context(charge_ratio: float, excess_noise: float, delta: float) -> Dictionary:
-	var dish: PetriDish = _dish_parent()
-	var total_vec: Vector2 = Vector2.ZERO
-	var nearby_bias: Vector2 = Vector2.ZERO
-	var nearby_strength: float = 0.0
-	var bond_bias: Vector2 = Vector2.ZERO
-	var bond_strength: float = 0.0
-	if dish != null:
-		total_vec = dish.sample_total_field(dish.to_global(position))
-		for other in dish.cells:
-			if other == self or other == null or other.signature == null:
-				continue
-			var offset: Vector2 = other.position - position
-			var dist: float = offset.length()
-			var reach: float = radius + other.radius + 72.0
-			if dist <= 0.001 or dist >= reach:
-				continue
-			var proximity: float = 1.0 - clampf(dist / reach, 0.0, 1.0)
-			var weight: float = proximity * (0.30 + 0.70 * other.charge_ratio_value())
-			nearby_bias += (offset / dist) * weight
-			nearby_strength = maxf(nearby_strength, weight)
-		for bond in dish.bonds:
-			if bond == null:
-				continue
-			if bond.a != self and bond.b != self:
-				continue
-			var bridge_offset: Vector2 = bond.midpoint() - position
-			var bridge_dist: float = bridge_offset.length()
-			if bridge_dist <= 0.001:
-				continue
-			var stable: float = clampf((bond.age / 0.8) * (1.0 - clampf(bond.strain, 0.0, 1.0) * 0.6), 0.0, 1.0)
-			var weight_bridge: float = (0.35 + bond.strength * 0.50) * (0.45 + stable * 0.55)
-			bond_bias += (bridge_offset / bridge_dist) * weight_bridge
-			bond_strength = maxf(bond_strength, weight_bridge)
-	var total_strength: float = total_vec.length() / maxf(PetriDish.TOTAL_FIELD_MAX_STRENGTH, 0.001)
-	var total_dir: Vector2 = Vector2.ZERO if total_vec.length_squared() <= 0.000001 else total_vec.normalized()
-	var raw_bias: Vector2 = total_dir * 0.40 + nearby_bias * 0.85 + bond_bias * 1.10
-	if raw_bias.length() > 1.0:
-		raw_bias = raw_bias.normalized()
-	var raw_interaction: float = clampf(total_strength * 0.55 + nearby_strength * 0.65 + bond_strength * 0.75 + seek_strength * 0.20 + capture_strength * 0.35 + excess_noise * 0.12, 0.0, 1.4)
-	# Low-pass smoothing keeps the sheath shape from snapping when nearby state
-	# changes. Smoothing is on the raw (un-normalized) bias so falling-off
-	# neighbors decay continuously instead of leaving a unit vector pointing at
-	# nothing. dt-aware lerp coefficient => stable across frame rates.
-	var bias_alpha: float = clampf(PLASMA_BIAS_LERP_RATE * delta, 0.0, 1.0)
-	var inter_alpha: float = clampf(PLASMA_INTERACTION_LERP_RATE * delta, 0.0, 1.0)
-	_plasma_bias_smooth = _plasma_bias_smooth.lerp(raw_bias, bias_alpha)
-	_plasma_interaction_smooth = lerpf(_plasma_interaction_smooth, raw_interaction, inter_alpha)
-	var bias_dir: Vector2 = Vector2.ZERO
-	if _plasma_bias_smooth.length_squared() > 0.000001:
-		bias_dir = _plasma_bias_smooth.limit_length(1.0)
-	# Phase derives from monotonic accumulated time and the persistent per-cell
-	# seed only. Interaction was previously folded into phase, which made the
-	# wave packets jump position whenever nearby state shifted; that reads as a
-	# restart. Interaction now modulates amplitude in the path drawer, not phase.
-	var pulse_phase: float = _plasma_time * LOCAL_PLASMA_PULSE_SPEED + _plasma_seed
-	return {
-		"bias_dir": bias_dir,
-		"interaction": _plasma_interaction_smooth,
-		"charge_ratio": charge_ratio,
-		"pulse_phase": pulse_phase,
-		"excess_noise": excess_noise,
-	}
-
-
 func _round_body_field_context() -> Dictionary:
 	var local_axis: Vector2 = Vector2.UP
 	var ambient_local: Vector2 = _ambient_debug_vector.rotated(-rotation)
@@ -1295,187 +1214,6 @@ func _round_body_field_context() -> Dictionary:
 	}
 
 
-func _draw_round_filament_path(points: PackedVector2Array, base_col: Color, alpha_scale: float, pulse_phase: float) -> void:
-	if points.size() < 2:
-		return
-	for i in range(points.size() - 1):
-		var p0: Vector2 = points[i]
-		var p1: Vector2 = points[i + 1]
-		var t0: float = float(i) / float(points.size() - 1)
-		var t1: float = float(i + 1) / float(points.size() - 1)
-		var mid_t: float = (t0 + t1) * 0.5
-		var center_weight: float = pow(maxf(sin(PI * mid_t), 0.0), 0.72)
-		var crawl: float = 0.72 + 0.28 * sin(pulse_phase - mid_t * 5.6)
-		var glow_w: float = CELL_PLASMA_FILAMENT_GLOW_WIDTH * (0.38 + 0.62 * center_weight)
-		var core_w: float = CELL_PLASMA_FILAMENT_WIDTH * (0.52 + 0.48 * center_weight)
-		var glow_col: Color = Color(
-			minf(1.0, base_col.r * (0.92 + crawl * 0.08)),
-			minf(1.0, base_col.g * (0.94 + crawl * 0.06)),
-			1.0,
-			CELL_PLASMA_FILAMENT_ALPHA * alpha_scale * (0.62 + 0.38 * crawl)
-		)
-		var core_col: Color = Color(
-			minf(1.0, 0.90 + base_col.r * 0.16),
-			minf(1.0, 0.95 + base_col.g * 0.08),
-			1.0,
-			CELL_PLASMA_FILAMENT_ALPHA * alpha_scale * 0.72 * (0.70 + 0.30 * crawl)
-		)
-		draw_line(p0, p1, glow_col, glow_w, true)
-		draw_line(p0, p1, core_col, core_w, true)
-
-
-func _draw_local_plasma(_jitter: Vector2, r: float, charge_ratio: float, excess_noise: float, delta: float) -> void:
-	if not LOCAL_PLASMA_ENABLED or signature == null:
-		return
-	# When the cell is bonded, the dish-level cluster sheath owns the outer
-	# field and renders it as one continuous union shape. Drawing the per-cell
-	# sheath on top would re-introduce the "three rings touching" read. Fade
-	# this layer out smoothly with bond count instead of cutting it off.
-	var bond_fade: float = 1.0 if bonded_count <= 0 else maxf(0.0, 1.0 - float(bonded_count) * 0.85)
-	if bond_fade <= 0.005:
-		return
-	# Plasma path positions are sampled in cell-local coordinates with NO
-	# per-frame jitter. The body draw still uses jitter for the cell shape, so
-	# the plasma reads as an attached field around the cell rather than a
-	# detached randomized halo.
-	var origin: Vector2 = Vector2.ZERO
-	var context: Dictionary = _local_plasma_context(charge_ratio, excess_noise, delta)
-	var base_col: Color = glow_color().lerp(Color(0.94, 0.99, 1.00, 1.0), 0.18)
-	var interaction: float = float(context["interaction"])
-	var pulse_phase: float = float(context["pulse_phase"])
-	var bias_dir: Vector2 = context["bias_dir"] as Vector2
-	var alpha_scale: float = (0.52 + 0.48 * charge_ratio) * (1.0 + interaction * LOCAL_PLASMA_INTERACTION_GAIN) * bond_fade
-	var geom: String = _canonical_geom()
-	match geom:
-		"round":
-			for band in 2:
-				var shell_points: PackedVector2Array = _sample_round_plasma_outline(origin, r, band, bias_dir, interaction, pulse_phase)
-				_draw_local_plasma_path(shell_points, base_col, true, alpha_scale, pulse_phase + float(band) * 0.8)
-		"triangle":
-			for band in 2:
-				var tri_points: PackedVector2Array = _sample_triangle_plasma_outline(origin, r, band, bias_dir, interaction, pulse_phase)
-				_draw_local_plasma_path(tri_points, base_col, true, alpha_scale * 0.92, pulse_phase + float(band) * 0.6)
-		"crescent":
-			var outer_points: PackedVector2Array = _sample_crescent_plasma_arc(origin, r * 1.14, bias_dir, interaction, pulse_phase, false)
-			var inner_points: PackedVector2Array = _sample_crescent_plasma_arc(origin, r * 0.88, bias_dir, interaction, pulse_phase + 0.9, true)
-			_draw_local_plasma_path(outer_points, base_col, false, alpha_scale, pulse_phase)
-			_draw_local_plasma_path(inner_points, base_col.lerp(Color(1.0, 0.92, 1.0, 1.0), 0.12), false, alpha_scale * 0.82, pulse_phase + 0.9)
-		"spiral":
-			for band in 2:
-				var coil_points: PackedVector2Array = _sample_capsule_plasma_outline(origin, Vector2(r * (0.88 + band * 0.10), r * (1.28 + band * 0.12)), bias_dir, interaction, pulse_phase + float(band) * 0.7)
-				_draw_local_plasma_path(coil_points, base_col, true, alpha_scale * 0.95, pulse_phase + float(band) * 0.7)
-		"line":
-			var line_points: PackedVector2Array = _sample_capsule_plasma_outline(origin, Vector2(r * 0.56, r * 1.46), bias_dir, interaction, pulse_phase)
-			_draw_local_plasma_path(line_points, base_col, true, alpha_scale * 0.84, pulse_phase)
-
-
-func _draw_local_plasma_path(points: PackedVector2Array, base_col: Color, closed: bool, alpha_scale: float, pulse_phase: float) -> void:
-	if points.size() < 2:
-		return
-	var limit: int = points.size() if closed else points.size() - 1
-	for i in range(limit):
-		var p0: Vector2 = points[i]
-		var p1: Vector2 = points[(i + 1) % points.size()]
-		var mid_t: float = (float(i) + 0.5) / float(maxi(limit, 1))
-		var envelope: float = 0.55 + 0.45 * pow(maxf(sin(PI * mid_t), 0.0), 0.7)
-		var pulse_head: float = 0.5 + 0.28 * sin(pulse_phase)
-		var pulse_tail: float = 0.5 + 0.24 * sin(pulse_phase + 1.6)
-		var packet_a: float = exp(-pow((mid_t - pulse_head) / 0.18, 2.0))
-		var packet_b: float = exp(-pow((mid_t - pulse_tail) / 0.22, 2.0))
-		var packet_mix: float = maxf(packet_a, packet_b)
-		var glow_w: float = LOCAL_PLASMA_GLOW_WIDTH * LOCAL_PLASMA_THICKNESS_GAIN * envelope
-		var core_w: float = LOCAL_PLASMA_CORE_WIDTH * LOCAL_PLASMA_THICKNESS_GAIN * envelope
-		var glow_col: Color = Color(
-			minf(1.0, base_col.r * (0.92 + packet_mix * 0.08) * LOCAL_PLASMA_BRIGHTNESS_GAIN),
-			minf(1.0, base_col.g * (0.94 + packet_mix * 0.06) * LOCAL_PLASMA_BRIGHTNESS_GAIN),
-			1.0,
-			LOCAL_PLASMA_GLOW_ALPHA * alpha_scale * (0.75 + packet_mix * LOCAL_PLASMA_PULSE_GAIN)
-		)
-		var core_col: Color = Color(
-			minf(1.0, 0.90 + base_col.r * 0.18),
-			minf(1.0, 0.95 + base_col.g * 0.08),
-			1.0,
-			LOCAL_PLASMA_CORE_ALPHA * alpha_scale * (0.82 + packet_mix * LOCAL_PLASMA_PULSE_GAIN)
-		)
-		draw_line(p0, p1, glow_col, glow_w, true)
-		draw_line(p0, p1, core_col, core_w, true)
-
-
-func _sample_round_plasma_outline(jitter: Vector2, r: float, band: int, bias_dir: Vector2, interaction: float, pulse_phase: float) -> PackedVector2Array:
-	var points: PackedVector2Array = PackedVector2Array()
-	var base_scale: float = 1.10 + float(band) * 0.10
-	for i in range(42):
-		var ang: float = (float(i) / 42.0) * TAU
-		var normal: Vector2 = Vector2(cos(ang), sin(ang))
-		var tangent: Vector2 = Vector2(-normal.y, normal.x)
-		var directional: float = normal.dot(bias_dir)
-		var side_flow: float = tangent.dot(bias_dir)
-		var wave: float = sin(ang * 2.0 + pulse_phase + float(band) * 0.9)
-		var radial: float = r * base_scale
-		radial += r * directional * LOCAL_PLASMA_DISTORTION_GAIN * interaction * 0.20
-		radial += r * wave * (0.020 + interaction * 0.020)
-		points.append(jitter + normal * radial + tangent * r * side_flow * interaction * 0.035)
-	return points
-
-
-func _sample_triangle_plasma_outline(jitter: Vector2, r: float, band: int, bias_dir: Vector2, interaction: float, pulse_phase: float) -> PackedVector2Array:
-	var tip: Vector2 = Vector2(0.0, -r * 1.24)
-	var base_r: Vector2 = Vector2(r * 1.02, r * 0.92)
-	var base_l: Vector2 = Vector2(-r * 1.02, r * 0.92)
-	var verts: Array[Vector2] = [tip, base_r, base_l]
-	var points: PackedVector2Array = PackedVector2Array()
-	for edge_idx in range(verts.size()):
-		var a: Vector2 = verts[edge_idx]
-		var b: Vector2 = verts[(edge_idx + 1) % verts.size()]
-		for seg in range(8):
-			var t: float = float(seg) / 8.0
-			var point: Vector2 = a.lerp(b, t)
-			var outward: Vector2 = point.normalized()
-			var tangent: Vector2 = Vector2(-outward.y, outward.x)
-			var directional: float = outward.dot(bias_dir)
-			var wave: float = sin((float(edge_idx) + t) * TAU + pulse_phase + float(band) * 0.7)
-			var inflate: float = r * (0.18 + float(band) * 0.06)
-			inflate += r * directional * LOCAL_PLASMA_DISTORTION_GAIN * interaction * 0.16
-			points.append(jitter + point + outward * inflate + tangent * wave * r * 0.025 * (0.4 + interaction))
-	return points
-
-
-func _sample_capsule_plasma_outline(jitter: Vector2, extents: Vector2, bias_dir: Vector2, interaction: float, pulse_phase: float) -> PackedVector2Array:
-	var points: PackedVector2Array = PackedVector2Array()
-	for i in range(36):
-		var ang: float = (float(i) / 36.0) * TAU
-		var normal: Vector2 = Vector2(cos(ang), sin(ang))
-		var tangent: Vector2 = Vector2(-normal.y, normal.x)
-		var directional: float = normal.dot(bias_dir)
-		var wave: float = sin(ang * 3.0 + pulse_phase)
-		var p: Vector2 = Vector2(normal.x * extents.x, normal.y * extents.y)
-		var distort: Vector2 = normal * extents.y * directional * LOCAL_PLASMA_DISTORTION_GAIN * interaction * 0.14
-		p += distort + tangent * extents.x * wave * 0.06 * (0.35 + interaction)
-		points.append(jitter + p)
-	return points
-
-
-func _sample_crescent_plasma_arc(jitter: Vector2, radius_value: float, bias_dir: Vector2, interaction: float, pulse_phase: float, inner: bool) -> PackedVector2Array:
-	var points: PackedVector2Array = PackedVector2Array()
-	var a_start: float = -PI * (0.82 if inner else 0.88)
-	var a_end: float = PI * (0.82 if inner else 0.88)
-	for i in range(26):
-		var t: float = float(i) / 25.0
-		var ang: float = lerpf(a_start, a_end, t)
-		var normal: Vector2 = Vector2(cos(ang), sin(ang))
-		var tangent: Vector2 = Vector2(-sin(ang), cos(ang))
-		if inner:
-			normal = -normal
-		var directional: float = normal.dot(bias_dir)
-		var wave: float = sin(t * TAU * 1.4 + pulse_phase)
-		var radial: float = radius_value + radius_value * directional * LOCAL_PLASMA_DISTORTION_GAIN * interaction * 0.12
-		var point: Vector2 = Vector2(cos(ang), sin(ang)) * radial
-		point += tangent * wave * radius_value * 0.035 * (0.35 + interaction)
-		points.append(jitter + point)
-	return points
-
-
-# ROUND: contained plasma orb — bright core, soft sheath, internal field filaments.
 func _draw_round(offset: Vector2, r: float, brightness: float, alpha: float, chroma: float, field_ctx: Dictionary) -> void:
 	var col: Color = _body_color(brightness, alpha)
 	var healthy: float = round_healthy_factor()
@@ -1489,8 +1227,8 @@ func _draw_round(offset: Vector2, r: float, brightness: float, alpha: float, chr
 	var total_strength: float = float(field_ctx.get("total_strength", ambient_strength))
 	var neighbor_strength: float = float(field_ctx.get("neighbor_strength", 0.0))
 	var plasma_phase: float = float(field_ctx.get("phase", _plasma_time * CELL_PLASMA_FLOW_SPEED + _plasma_seed))
-	var core_shift: Vector2 = axis * (sin(plasma_phase * 0.78) * r * CELL_PLASMA_WARP_STRENGTH * 0.10)
-	core_shift += perp * (cos(plasma_phase * 0.58 + 0.6) * r * CELL_PLASMA_WARP_STRENGTH * 0.07)
+	var core_shift: Vector2 = axis * (sin(plasma_phase * 0.78) * r * 0.20 * 0.10)
+	core_shift += perp * (cos(plasma_phase * 0.58 + 0.6) * r * 0.20 * 0.07)
 	# Outer atmospheric halo (kept soft so the orb remains discrete).
 	for i in 2:
 		var t_halo: float = float(i) / 2.0
@@ -1508,9 +1246,9 @@ func _draw_round(offset: Vector2, r: float, brightness: float, alpha: float, chr
 		var inner_r: float = r * (0.98 - t * 0.66)
 		var layer_shift: Vector2 = core_shift * (0.12 + t * 0.28)
 		var inner: Color = Color(
-			lerpf(col.r, 1.0, (0.28 + t * 0.50) * CELL_PLASMA_CORE_BRIGHTNESS * 0.72),
-			lerpf(col.g, 1.0, (0.34 + t * 0.46) * CELL_PLASMA_CORE_BRIGHTNESS * 0.76),
-			lerpf(col.b, 1.0, (0.42 + t * 0.42) * CELL_PLASMA_CORE_BRIGHTNESS * 0.82),
+			lerpf(col.r, 1.0, (0.28 + t * 0.50) * 1.26 * 0.72),
+			lerpf(col.g, 1.0, (0.34 + t * 0.46) * 1.26 * 0.76),
+			lerpf(col.b, 1.0, (0.42 + t * 0.42) * 1.26 * 0.82),
 			alpha * (0.14 + t * 0.22) * (0.78 + total_strength * 0.22),
 		)
 		if healthy > 0.0:
@@ -1519,38 +1257,11 @@ func _draw_round(offset: Vector2, r: float, brightness: float, alpha: float, chr
 			inner.b = lerpf(inner.b, 1.0, healthy * 0.24)
 			inner.a += healthy * 0.06
 		draw_circle(offset + layer_shift, inner_r, inner)
-	# Internal contained filaments: live inside the orb and follow field bias.
-	var filament_count: int = CELL_PLASMA_FILAMENT_COUNT
-	for idx in range(filament_count):
-		var lane: float = 0.0
-		if filament_count > 1:
-			lane = lerpf(-1.0, 1.0, float(idx) / float(filament_count - 1))
-		var points: PackedVector2Array = PackedVector2Array()
-		var samples: int = 13
-		for s in range(samples):
-			var u: float = float(s) / float(samples - 1)
-			var x_n: float = lerpf(-0.72, 0.72, u)
-			var span: float = sqrt(maxf(0.0, 1.0 - x_n * x_n))
-			var lane_span: float = span * (0.96 - absf(lane) * 0.14)
-			var wave_a: float = sin(plasma_phase + u * TAU * 1.20 + lane * 1.6)
-			var wave_b: float = cos(plasma_phase * 0.66 + u * TAU * 0.86 - lane * 1.1)
-			var x_warp: float = x_n + wave_b * 0.05 * neighbor_strength * lane_span
-			var y_n: float = lane * (0.20 + 0.10 * absf(lane)) * lane_span
-			y_n += wave_a * 0.085 * (0.35 + total_strength * 0.65) * lane_span
-			y_n += wave_b * 0.045 * (0.40 + ambient_strength * 0.60) * lane_span
-			var local: Vector2 = axis * (x_warp * r * 0.78) + perp * (y_n * r * 0.92)
-			points.append(offset + local)
-		var filament_col: Color = col.lerp(Color(0.96, 0.99, 1.0, 1.0), 0.34 + total_strength * 0.18)
-		var filament_alpha: float = alpha * (0.76 + total_strength * 0.20) * (0.86 - absf(lane) * 0.14)
-		_draw_round_filament_path(points, filament_col, filament_alpha, plasma_phase + lane * 0.9)
-	# Thin luminous sheath: full soft band plus brighter field-biased highlights.
-	var sheath_width: float = maxf(0.9, r * CELL_PLASMA_SHEATH_WIDTH * 0.34)
-	var sheath_base: Color = Color(0.82 + col.r * 0.18, 0.90 + col.g * 0.10, 1.0, alpha * 0.20 * CELL_PLASMA_SHEATH_BRIGHTNESS)
+	# Thin luminous sheath: clean closed band; no internal lanes, no asymmetric
+	# pole highlights — projected polarity expression lives in the dipole arcs.
+	var sheath_width: float = maxf(0.9, r * 0.06)
+	var sheath_base: Color = Color(0.82 + col.r * 0.18, 0.90 + col.g * 0.10, 1.0, alpha * 0.18)
 	draw_arc(offset, r * 0.985, 0.0, TAU, 42, sheath_base, sheath_width, true)
-	var sheath_angle: float = axis.angle()
-	var highlight_col: Color = Color(0.95, 0.99, 1.0, alpha * (0.22 + total_strength * 0.12) * CELL_PLASMA_SHEATH_BRIGHTNESS)
-	draw_arc(offset, r * 0.99, sheath_angle - 0.92, sheath_angle + 0.92, 18, highlight_col, sheath_width * 1.28, true)
-	draw_arc(offset, r * 0.985, sheath_angle + PI - 0.64, sheath_angle + PI + 0.64, 14, Color(0.78, 0.92, 1.0, alpha * (0.12 + neighbor_strength * 0.10) * CELL_PLASMA_SHEATH_BRIGHTNESS), sheath_width, true)
 	if over > 0.0:
 		draw_circle(offset, r * 1.02, Color(1.0, 0.84, 0.54, alpha * (0.05 + over * 0.08)))
 	if noisy > 0.04:

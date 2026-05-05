@@ -17,10 +17,6 @@ var broken: bool = false
 var capture_timer: float = 0.0
 var hold_timer: float = 0.0
 var over_strain_time: float = 0.0
-# Smoothed merge factor used by the local plasma shader to fade a bond from
-# "two halos touching" (0.0) to "one shared throat" (1.0) as the bond ages
-# and stays low-strain. Updated each frame in PetriDish._update_local_plasma.
-var plasma_merge_factor: float = 0.0
 
 
 func _init(
